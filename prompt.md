@@ -35,6 +35,7 @@ A Bun-powered TypeScript micro-service that listens to GitHub webhooks and posts
 | `LOG_FILE` | ✖︎ | `server.log` | Path to log file. |
 | `DEVELOPED_STATUS_NAME` | ✖︎ | `Developed` | The exact status name to apply on PR merge. |
 | `DEVELOPED_STATUS_ID` | ✖︎ | – | Skip lookup and use this status id directly. |
+| `DISCORD_WEBHOOK_URL` | ✖︎ | – | Discord Incoming Webhook URL to send WP status notifications. |
 
 ---
 
@@ -127,6 +128,14 @@ ENFORCE_GITHUB_SIGNATURE=false bun run server.ts
 * **PR opened / reopened / ready** → 🚀 comment with PR link.
 * **PR comment** → 💬 comment quoting the author & first line.
 * **PR merged** → ✅ comment then status change to *Developed*.
+
+---
+
+## OpenProject → Discord
+
+Configure an OpenProject *webhook* pointing to `POST http(s)://<server>/op-update` with the sample payload format.
+
+When the server receives a `work_package:updated` event whose `status.id > 8` it posts a Discord message via `DISCORD_WEBHOOK_URL` summarising the change and linking to the work package.
 
 ---
 
