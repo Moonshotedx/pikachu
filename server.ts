@@ -215,6 +215,7 @@ serve({
   port: Number(process.env.PORT ?? 3000),
   async fetch(req) {
     const { pathname } = new URL(req.url);
+    console.log(`🌐 ${req.method} ${pathname}`);
 
     // Health-check endpoint ➜ always 200 OK JSON
     if (req.method === "GET" && pathname === "/health") {
@@ -235,15 +236,23 @@ serve({
       }
 
       if (payload.action === "work_package:updated") {
-        const statusId = payload.work_package?.status?.id;
+        const statusObj = payload.work_package?.status ?? payload.work_package?._embedded?.status ?? {};
+        const statusIdRaw = statusObj.id;
+        const statusId = Number(statusIdRaw);
+        const statusName = statusObj.name ?? `Status ${statusId}`;
+        console.log("raw", statusIdRaw);
+        console.log("id:", statusId);
+        console.log("type:", typeof statusId);
+        console.log(typeof statusId === "number" && statusId > 8);
         if (typeof statusId === "number" && statusId > 8) {
+          console.log("🔔 Sending Discord notification for WP update now");
           const wpId = payload.work_package?.id;
           const subject = payload.work_package?.subject ?? "WP";
           const project = payload.work_package?._embedded?.project?.identifier ?? "project";
           const base = process.env.OPENPROJECT_BASE_URL ?? "";
           const wpUrl = `${base}/work_packages/${wpId}`;
-          const msg = `🛠️ Work package **#${wpId} - ${subject}** in project **${project}** moved to status ID ${statusId}.\n${wpUrl}`;
-          console.log("🔔 Sending Discord notification for WP update", wpId);
+          const msg = `🛠️ Work package **#${wpId} - ${subject}** in project **${project}** moved to **${statusName}**.\n${wpUrl}`;
+          console.log("📨 Sending Discord message:", msg);
           await sendDiscordNotification(msg);
         }
       }
