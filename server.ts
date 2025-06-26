@@ -224,7 +224,34 @@ serve({
       });
     }
 
-    // Only handle GitHub webhooks below
+    // OpenProject webhook endpoint — handle before reading body elsewhere
+    if (req.method === "POST" && pathname === "/op-update") {
+      const bodyText = await req.text();
+      let payload: any;
+      try {
+        payload = JSON.parse(bodyText);
+      } catch {
+        return new Response("Bad JSON", { status: 400 });
+      }
+
+      if (payload.action === "work_package:updated") {
+        const statusId = payload.work_package?.status?.id;
+        if (typeof statusId === "number" && statusId > 8) {
+          const wpId = payload.work_package?.id;
+          const subject = payload.work_package?.subject ?? "WP";
+          const project = payload.work_package?._embedded?.project?.identifier ?? "project";
+          const base = process.env.OPENPROJECT_BASE_URL ?? "";
+          const wpUrl = `${base}/work_packages/${wpId}`;
+          const msg = `🛠️ Work package **#${wpId} - ${subject}** in project **${project}** moved to status ID ${statusId}.\n${wpUrl}`;
+          console.log("🔔 Sending Discord notification for WP update", wpId);
+          await sendDiscordNotification(msg);
+        }
+      }
+
+      return new Response("OK", { status: 200 });
+    }
+
+    // ---- GitHub webhook handling below (may read body for signature) ----
     if (req.method !== "POST") {
       return new Response("Not Found", { status: 404 });
     }
@@ -352,33 +379,6 @@ serve({
         console.log(`📝 Posting PR comment from ${commentUser} to WP #${workPackageId}`);
         await postOpenProjectComment(workPackageId, wpComment);
       }
-    }
-
-    // OpenProject webhook endpoint
-    if (req.method === "POST" && pathname === "/op-update") {
-      const bodyText = await req.text();
-      let payload: any;
-      try {
-        payload = JSON.parse(bodyText);
-      } catch {
-        return new Response("Bad JSON", { status: 400 });
-      }
-
-      if (payload.action === "work_package:updated") {
-        const statusId = payload.work_package?.status?.id;
-        if (typeof statusId === "number" && statusId > 8) {
-          const wpId = payload.work_package?.id;
-          const subject = payload.work_package?.subject ?? "WP";
-          const project = payload.work_package?._embedded?.project?.identifier ?? "project";
-          const base = process.env.OPENPROJECT_BASE_URL ?? "";
-          const wpUrl = `${base}/work_packages/${wpId}`;
-          const msg = `🛠️ Work package **#${wpId} - ${subject}** in project **${project}** moved to status ID ${statusId}.\n${wpUrl}`;
-          console.log("🔔 Sending Discord notification for WP update", wpId);
-          await sendDiscordNotification(msg);
-        }
-      }
-
-      return new Response("OK", { status: 200 });
     }
 
     // Respond quickly to GitHub (must be <10s)
