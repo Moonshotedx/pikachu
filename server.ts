@@ -190,6 +190,27 @@ function extractWpIdFromString(text: string): string | null {
   return m[1] || m[2] || null;
 }
 
+// Discord notification helper ------------------------------------------------
+async function sendDiscordNotification(message: string) {
+  const url = process.env.DISCORD_WEBHOOK_URL;
+  if (!url) {
+    console.warn("DISCORD_WEBHOOK_URL not set; skipping Discord notification");
+    return;
+  }
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ content: message }),
+    });
+    if (!res.ok) {
+      console.error(`❌ Discord webhook error ${res.status}`);
+    }
+  } catch (e) {
+    console.error("❌ Discord webhook exception", e);
+  }
+}
+
 serve({
   port: Number(process.env.PORT ?? 3000),
   async fetch(req) {
@@ -331,6 +352,33 @@ serve({
         console.log(`📝 Posting PR comment from ${commentUser} to WP #${workPackageId}`);
         await postOpenProjectComment(workPackageId, wpComment);
       }
+    }
+
+    // OpenProject webhook endpoint
+    if (req.method === "POST" && pathname === "/op-update") {
+      const bodyText = await req.text();
+      let payload: any;
+      try {
+        payload = JSON.parse(bodyText);
+      } catch {
+        return new Response("Bad JSON", { status: 400 });
+      }
+
+      if (payload.action === "work_package:updated") {
+        const statusId = payload.work_package?.status?.id;
+        if (typeof statusId === "number" && statusId > 8) {
+          const wpId = payload.work_package?.id;
+          const subject = payload.work_package?.subject ?? "WP";
+          const project = payload.work_package?._embedded?.project?.identifier ?? "project";
+          const base = process.env.OPENPROJECT_BASE_URL ?? "";
+          const wpUrl = `${base}/work_packages/${wpId}`;
+          const msg = `🛠️ Work package **#${wpId} - ${subject}** in project **${project}** moved to status ID ${statusId}.\n${wpUrl}`;
+          console.log("🔔 Sending Discord notification for WP update", wpId);
+          await sendDiscordNotification(msg);
+        }
+      }
+
+      return new Response("OK", { status: 200 });
     }
 
     // Respond quickly to GitHub (must be <10s)
