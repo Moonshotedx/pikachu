@@ -229,17 +229,35 @@ async function sendDiscordNotification(message: string) {
     console.warn("DISCORD_WEBHOOK_URL not set; skipping Discord notification");
     return;
   }
-  try {
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ content: message }),
-    });
-    if (!res.ok) {
-      console.error(`❌ Discord webhook error ${res.status}`);
+
+  // Discord messages cannot exceed 2000 characters. We'll send in chunks ≤1900.
+  const MAX_LEN = 1900;
+  const chunks: string[] = [];
+  let remaining = message;
+  while (remaining.length > MAX_LEN) {
+    let splitIdx = remaining.lastIndexOf("\n", MAX_LEN);
+    if (splitIdx === -1 || splitIdx < 1500) {
+      // No newline found in a reasonable window, hard split
+      splitIdx = MAX_LEN;
     }
-  } catch (e) {
-    console.error("❌ Discord webhook exception", e);
+    chunks.push(remaining.slice(0, splitIdx));
+    remaining = remaining.slice(splitIdx);
+  }
+  if (remaining.length) chunks.push(remaining);
+
+  for (const chunk of chunks) {
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content: chunk }),
+      });
+      if (!res.ok) {
+        console.error(`❌ Discord webhook error ${res.status}`);
+      }
+    } catch (e) {
+      console.error("❌ Discord webhook exception", e);
+    }
   }
 }
 
@@ -290,6 +308,142 @@ function mapWpSummary(wp: any) {
     dueDate: wp.dueDate,
   };
 }
+
+// NEW: Reusable function that returns today's and overdue task summaries
+export async function getTodaySummary(): Promise<{ today: any[]; overdue: any[] }> {
+  const taskId = await getTaskTypeId();
+
+  // Tasks due today
+  const dueTodayFilters = [
+    { due_date: { operator: "t", values: [] } }, // today
+    ...(taskId ? [{ type: { operator: "=", values: [taskId] } }] : []),
+  ];
+
+  // Overdue tasks (due date before today)
+  const overdueFilters = [
+    { due_date: { operator: "<t-", values: ["0"] } }, // before today
+    ...(taskId ? [{ type: { operator: "=", values: [taskId] } }] : []),
+  ];
+
+  const [todayWps, overdueWps] = await Promise.all([
+    fetchWorkPackages(dueTodayFilters),
+    fetchWorkPackages(overdueFilters),
+  ]);
+
+  return {
+    today: todayWps.map(mapWpSummary),
+    overdue: overdueWps.map(mapWpSummary),
+  };
+}
+
+// Helper: build markdown table for Discord messages
+function buildMarkdownTable(
+  headers: string[],
+  rows: (string | number | null)[][],
+  fixedWidths?: number[],
+): string {
+  if (!rows.length) return "_No tasks_";
+  const allRows = [headers, ...rows];
+  const colWidths = headers.map((_, idx) => {
+    const computed = Math.max(...allRows.map((r) => String(r[idx] ?? "").length));
+    return fixedWidths && fixedWidths[idx] ? Math.max(fixedWidths[idx], computed) : computed;
+  });
+  const pad = (val: string, len: number) => val + " ".repeat(len - val.length);
+  const formatRow = (row: any[]) =>
+    "|" + row.map((cell, idx) => pad(String(cell ?? ""), colWidths[idx])).join("|") + "|";
+  const lines = [
+    formatRow(headers),
+    "|" + colWidths.map((w) => "-".repeat(w)).join("|") + "|",
+    ...rows.map(formatRow),
+  ];
+  return lines.join("\n");
+}
+
+// Format the daily summary into a Discord-friendly markdown message
+async function formatDailySummaryMessage(): Promise<string> {
+  const summary = await getTodaySummary();
+  const todayStr = new Date().toISOString().slice(0, 10);
+
+  function truncate(str: string, max = 30) {
+    return str.length > max ? str.slice(0, max - 3) + "..." : str;
+  }
+
+  const formatItem = (wp: any, includeDue = false) => {
+    const parts = [
+      `**#${wp.id}**`,
+      truncate(wp.subject, 40),
+      `(${wp.status})`,
+      wp.assignee ? `— ${wp.assignee}` : "",
+      includeDue && wp.dueDate ? `— Due ${wp.dueDate}` : "",
+    ]
+      .filter(Boolean)
+      .join(" ");
+    return `• ${parts}`;
+  };
+
+  const todayList = summary.today.map((wp) => formatItem(wp)).join("\n");
+  const overdueList = summary.overdue
+    .map((wp) => formatItem(wp, true))
+    .join("\n");
+
+  return [
+    `📋 **Daily Task Summary (${todayStr})**`,
+    "",
+    "**Due Today:**",
+    todayList || "No tasks due today.",
+    "",
+    "**Overdue Tasks:**",
+    overdueList || "No overdue tasks.",
+  ].join("\n");
+}
+
+// Scheduler: run at configured times each day to send the summary to Discord
+function scheduleDailySummaries() {
+  const timesEnv = process.env.DAILY_SUMMARY_TIMES; // e.g., "12:00,16:00,20:30"
+  if (!timesEnv) {
+    console.log("ℹ️  DAILY_SUMMARY_TIMES not set; daily summaries disabled");
+    return;
+  }
+
+  const times = timesEnv.split(/[,;\s]+/).filter(Boolean);
+  if (!times.length) return;
+
+  function scheduleForTime(timeStr: string) {
+    const [hStr, mStr = "0"] = timeStr.split(":");
+    const hour = Number(hStr);
+    const minute = Number(mStr);
+    if (isNaN(hour) || hour < 0 || hour > 23 || isNaN(minute) || minute < 0 || minute > 59) {
+      console.warn(`⚠️  Invalid DAILY_SUMMARY_TIMES entry '${timeStr}', skipping`);
+      return;
+    }
+
+    const scheduleNext = () => {
+      const now = new Date();
+      const next = new Date(now);
+      next.setHours(hour, minute, 0, 0);
+      if (next <= now) {
+        next.setDate(now.getDate() + 1);
+      }
+      const delay = next.getTime() - now.getTime();
+      console.log(`⏰ Scheduled daily summary for ${timeStr} in ${Math.round(delay / 1000)}s`);
+      setTimeout(async () => {
+        try {
+          const content = await formatDailySummaryMessage();
+          await sendDiscordNotification(content);
+          console.log("✅ Daily summary sent to Discord (" + timeStr + ")");
+        } catch (e) {
+          console.error("❌ Failed to send daily summary", e);
+        }
+        scheduleNext(); // reschedule for next day
+      }, delay);
+    };
+
+    scheduleNext();
+  }
+
+  times.forEach(scheduleForTime);
+}
+
 // --------------------------------------------------------------------------
 
 serve({
@@ -339,6 +493,21 @@ serve({
         status: 200,
         headers: { "Content-Type": "application/json" },
       });
+    }
+
+    // Trigger daily summary to Discord immediately
+    if (req.method === "GET" && pathname === "/triggerNow") {
+      try {
+        const msg = await formatDailySummaryMessage();
+        await sendDiscordNotification(msg);
+        return new Response(JSON.stringify({ status: "sent" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      } catch (e) {
+        console.error("❌ Failed to send on-demand summary", e);
+        return new Response("Error", { status: 500 });
+      }
     }
 
     // OpenProject webhook endpoint — handle before reading body elsewhere
@@ -525,3 +694,6 @@ serve({
 
 const effectivePort = Number(process.env.PORT ?? 3000);
 console.log(`🚀 Pikachu helper listening on port ${effectivePort}`);
+
+// Kick off daily summary scheduler after server start
+scheduleDailySummaries();
