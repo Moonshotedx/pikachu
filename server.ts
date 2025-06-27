@@ -398,6 +398,78 @@ function buildMarkdownTable(
   return lines.join("\n");
 }
 
+// ------------------------ NEW HTML SUMMARY HELPERS ------------------------
+
+function escapeHtml(str: string): string {
+  return str
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function buildHtmlSummary(summary: { today: any[]; overdue: any[] }): string {
+  const todayStr = new Date().toISOString().slice(0, 10);
+  const base = (process.env.OPENPROJECT_BASE_URL ?? "").replace(/\/$/, "");
+
+  const renderRows = (items: any[]) =>
+    items
+      .map((wp) => {
+        const subject = escapeHtml(wp.subject ?? "");
+        const status = escapeHtml(wp.status ?? "");
+        const assignee = escapeHtml(wp.assignee ?? "—");
+        const project = escapeHtml(wp.project ?? "—");
+        const due = wp.dueDate ? escapeHtml(wp.dueDate) : "—";
+        const url = base ? `${base}/work_packages/${wp.id}` : "#";
+        return `<tr>
+          <td><a href="${url}" target="_blank">#${wp.id}</a></td>
+          <td>${subject}</td>
+          <td>${status}</td>
+          <td>${assignee}</td>
+          <td>${project}</td>
+          <td>${due}</td>
+        </tr>`;
+      })
+      .join("\n");
+
+  const section = (title: string, items: any[]) => {
+    if (!items.length) {
+      return `<h2>${title}</h2><p><em>No tasks</em></p>`;
+    }
+    return `<h2>${title}</h2>
+      <table>
+        <thead>
+          <tr><th>ID</th><th>Subject</th><th>Status</th><th>Assignee</th><th>Project</th><th>Due</th></tr>
+        </thead>
+        <tbody>
+          ${renderRows(items)}
+        </tbody>
+      </table>`;
+  };
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Daily Task Summary ${todayStr}</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 2rem; }
+    table { border-collapse: collapse; width: 100%; margin-bottom: 2rem; }
+    th, td { border: 1px solid #ccc; padding: 6px 10px; text-align: left; }
+    th { background: #f0f0f0; }
+    a { color: #0366d6; text-decoration: none; }
+  </style>
+</head>
+<body>
+  <h1>📋 Daily Task Summary (${todayStr})</h1>
+  ${section("Due Today", summary.today)}
+  ${section("Overdue Tasks", summary.overdue)}
+</body>
+</html>`;
+}
+// ---------------------- END HTML SUMMARY HELPERS -------------------------
+
 // Format the daily summary into a Discord-friendly markdown message
 async function formatDailySummaryMessage(): Promise<string> {
   const summary = await getTodaySummary();
@@ -505,6 +577,16 @@ serve({
       return new Response(JSON.stringify(summary), {
         status: 200,
         headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    // NEW: HTML view of today's and overdue tasks
+    if (req.method === "GET" && pathname === "/getTodaySummaryView") {
+      const summary = await getTodaySummary();
+      const html = buildHtmlSummary(summary);
+      return new Response(html, {
+        status: 200,
+        headers: { "Content-Type": "text/html; charset=utf-8" },
       });
     }
 
