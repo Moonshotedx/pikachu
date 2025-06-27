@@ -14,6 +14,13 @@ RUN bun install --production --no-progress
 # Copy source
 COPY . .
 
+# Install timezone data and set default to Asia/Kolkata (IST)
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends tzdata \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV TZ=Asia/Kolkata
+
 # Expose default port
 EXPOSE 3000
 
