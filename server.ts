@@ -223,8 +223,8 @@ function extractWpIdFromString(text: string): string | null {
 }
 
 // Discord notification helper ------------------------------------------------
-async function sendDiscordNotification(message: string) {
-  const url = process.env.DISCORD_WEBHOOK_URL;
+async function sendDiscordNotification(message: string, webhookUrl?: string) {
+  const url = webhookUrl || process.env.DISCORD_WEBHOOK_URL;
   if (!url) {
     console.warn("DISCORD_WEBHOOK_URL not set; skipping Discord notification");
     return;
@@ -429,7 +429,7 @@ function scheduleDailySummaries() {
       setTimeout(async () => {
         try {
           const content = await formatDailySummaryMessage();
-          await sendDiscordNotification(content);
+          await sendDiscordNotification(content, process.env.DISCORD_SUMMARY_WEBHOOK_URL || undefined);
           console.log("✅ Daily summary sent to Discord (" + timeStr + ")");
         } catch (e) {
           console.error("❌ Failed to send daily summary", e);
@@ -499,7 +499,7 @@ serve({
     if (req.method === "GET" && pathname === "/triggerNow") {
       try {
         const msg = await formatDailySummaryMessage();
-        await sendDiscordNotification(msg);
+        await sendDiscordNotification(msg, process.env.DISCORD_SUMMARY_WEBHOOK_URL || undefined);
         return new Response(JSON.stringify({ status: "sent" }), {
           status: 200,
           headers: { "Content-Type": "application/json" },
