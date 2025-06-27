@@ -255,6 +255,18 @@ serve({
           console.log("📨 Sending Discord message:", msg);
           await sendDiscordNotification(msg);
         }
+      } else if (payload.action === "work_package:created") {
+        // New work package created → notify Discord (if webhook configured)
+        const wpId = payload.work_package?.id;
+        const subject = payload.work_package?.subject ?? "Work package";
+        const project = payload.work_package?._embedded?.project?.identifier ?? "project";
+        const author = payload.work_package?._embedded?.author?.name ?? "someone";
+        const base = process.env.OPENPROJECT_BASE_URL ?? "";
+        const wpUrl = `${base}/work_packages/${wpId}`;
+        const msg = `🆕 Work package **#${wpId} - ${subject}** created in project **${project}** by **${author}**.\n${wpUrl}`;
+        console.log("🔔 Sending Discord notification for WP creation now");
+        console.log("📨 Sending Discord message:", msg);
+        await sendDiscordNotification(msg);
       }
 
       return new Response("OK", { status: 200 });
