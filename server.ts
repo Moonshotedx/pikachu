@@ -365,9 +365,13 @@ export async function getTodaySummary(): Promise<{ today: any[]; overdue: any[] 
     return true;
   };
 
+  const todayOpen = todayWps.filter(isOpen);
+  const todayIds = new Set(todayOpen.map((wp: any) => wp.id));
+  const overdueOpen = overdueWps.filter(isOpen).filter((wp: any) => !todayIds.has(wp.id));
+
   return {
-    today: todayWps.filter(isOpen).map(mapWpSummary),
-    overdue: overdueWps.filter(isOpen).map(mapWpSummary),
+    today: todayOpen.map(mapWpSummary),
+    overdue: overdueOpen.map(mapWpSummary),
   };
 }
 
