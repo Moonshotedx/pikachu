@@ -330,9 +330,44 @@ export async function getTodaySummary(): Promise<{ today: any[]; overdue: any[] 
     fetchWorkPackages(overdueFilters),
   ]);
 
+  // Filter helper – consider a work-package open if status.isClosed !== true
+  const isOpen = (wp: any): boolean => {
+    const embeddedStatus = wp._embedded?.status;
+
+    // 1. Prefer explicit boolean flag if available
+    if (embeddedStatus && typeof embeddedStatus.isClosed === "boolean") {
+      return !embeddedStatus.isClosed;
+    }
+
+    // 2. Check embedded status name
+    if (embeddedStatus?.name) {
+      return embeddedStatus.name.toString().toLowerCase() !== "closed";
+    }
+
+    // 3. Fallback to _links.status.title (often present when not embedded)
+    const linkStatusTitle = wp._links?.status?.title;
+    if (linkStatusTitle) {
+      return linkStatusTitle.toString().toLowerCase() !== "closed";
+    }
+
+    // 4. Finally, inspect status id from href (e.g., /api/v3/statuses/11)
+    const href: string | undefined = wp._links?.status?.href;
+    if (href) {
+      const idStr = href.split("/").pop();
+      const idNum = Number(idStr);
+      if (!Number.isNaN(idNum)) {
+        // Convention in this project: status id > 8 considered closed/completed
+        return idNum <= 8;
+      }
+    }
+
+    // If in doubt, treat as open (so we don't accidentally hide tasks)
+    return true;
+  };
+
   return {
-    today: todayWps.map(mapWpSummary),
-    overdue: overdueWps.map(mapWpSummary),
+    today: todayWps.filter(isOpen).map(mapWpSummary),
+    overdue: overdueWps.filter(isOpen).map(mapWpSummary),
   };
 }
 
@@ -462,33 +497,7 @@ serve({
 
     // Summary of today's and overdue tasks
     if (req.method === "GET" && pathname === "/getTodaySummary") {
-      const taskId = await getTaskTypeId();
-
-      const todayStr = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
-
-      // Tasks due today
-      const dueTodayFilters = [
-        // "t" operator ➜ due today (no values)
-        { due_date: { operator: "t", values: [] } },
-        ...(taskId ? [{ type: { operator: "=", values: [taskId] } }] : []),
-      ];
-      // Overdue tasks (dueDate before today)
-      const overdueFilters = [
-        // "<t-" 0 ➜ due date is more than 0 days in the past (before today)
-        { due_date: { operator: "<t-", values: ["0"] } },
-        ...(taskId ? [{ type: { operator: "=", values: [taskId] } }] : []),
-      ];
-
-      const [todayWps, overdueWps] = await Promise.all([
-        fetchWorkPackages(dueTodayFilters),
-        fetchWorkPackages(overdueFilters),
-      ]);
-
-      const summary = {
-        today: todayWps.map(mapWpSummary),
-        overdue: overdueWps.map(mapWpSummary),
-      };
-
+      const summary = await getTodaySummary();
       return new Response(JSON.stringify(summary), {
         status: 200,
         headers: { "Content-Type": "application/json" },
