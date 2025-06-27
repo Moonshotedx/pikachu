@@ -110,6 +110,8 @@ process.on("SIGTERM", () => {
 
 // Cache of status IDs
 let developedStatusId: string | null = null;
+// Cache of the default task type id
+let taskTypeId: string | null = null;
 
 async function getDevelopedStatusId(): Promise<string | null> {
   // Manual override via env var
@@ -137,6 +139,36 @@ async function getDevelopedStatusId(): Promise<string | null> {
     return developedStatusId;
   }
   console.warn(`⚠️  Status '${desiredName}' not found in OpenProject`);
+  return null;
+}
+
+async function getTaskTypeId(): Promise<string | null> {
+  // Allow overriding via env
+  const envId = process.env.TASK_TYPE_ID;
+  if (envId) {
+    taskTypeId = envId;
+    return taskTypeId;
+  }
+
+  if (taskTypeId) return taskTypeId;
+
+  const baseUrl = process.env.OPENPROJECT_BASE_URL;
+  const apiKey = process.env.OPENPROJECT_API_KEY;
+  if (!baseUrl || !apiKey) return null;
+
+  const auth = Buffer.from(`apikey:${apiKey}`).toString("base64");
+  const res = await fetch(`${baseUrl.replace(/\/$/, "")}/api/v3/types`, {
+    headers: { Accept: "application/json", Authorization: `Basic ${auth}` },
+  });
+  if (!res.ok) return null;
+  const json: any = await res.json();
+  const task = (json._embedded?.elements ?? []).find((t: any) => (t.name ?? "").toLowerCase() === "task");
+  if (task) {
+    taskTypeId = String(task.id);
+    console.log(`ℹ️  Cached 'Task' type as ID ${taskTypeId}`);
+    return taskTypeId;
+  }
+  console.warn("⚠️  Could not resolve Task type id from OpenProject");
   return null;
 }
 
@@ -211,6 +243,55 @@ async function sendDiscordNotification(message: string) {
   }
 }
 
+// ---- Helper to query OpenProject work packages with arbitrary filters ------
+async function fetchWorkPackages(filters: any[]): Promise<any[]> {
+  const baseUrl = process.env.OPENPROJECT_BASE_URL;
+  const apiKey = process.env.OPENPROJECT_API_KEY;
+  if (!baseUrl || !apiKey) {
+    console.error("Missing OPENPROJECT_BASE_URL or OPENPROJECT_API_KEY env vars");
+    return [];
+  }
+  const auth = Buffer.from(`apikey:${apiKey}`).toString("base64");
+  const query = encodeURIComponent(JSON.stringify(filters));
+  const url = `${baseUrl.replace(/\/$/, "")}/api/v3/work_packages?filters=${query}&pageSize=500&include=status,assignee,project`;
+  console.log("➡️  OpenProject GET", url);
+  const res = await fetch(url, {
+    headers: { Accept: "application/json", Authorization: `Basic ${auth}` },
+  });
+  if (!res.ok) {
+    console.error(`❌ OpenProject API error (${res.status}) when querying work packages`);
+    return [];
+  }
+  const json: any = await res.json();
+  return json._embedded?.elements ?? [];
+}
+
+function mapWpSummary(wp: any) {
+  return {
+    id: wp.id,
+    subject: wp.subject,
+    status:
+      wp._embedded?.status?.name ??
+      wp.status?.name ??
+      wp._links?.status?.title ??
+      "unknown",
+    assignee:
+      wp._embedded?.assignee?.name ??
+      wp.assignee?.name ??
+      wp._links?.assignee?.title ??
+      null,
+    project:
+      wp._embedded?.project?.name ??
+      wp._embedded?.project?.title ??
+      wp.project?.name ??
+      wp._links?.project?.title ??
+      null,
+    startDate: wp.startDate ?? wp.start_date ?? null,
+    dueDate: wp.dueDate,
+  };
+}
+// --------------------------------------------------------------------------
+
 serve({
   port: Number(process.env.PORT ?? 3000),
   async fetch(req) {
@@ -220,6 +301,41 @@ serve({
     // Health-check endpoint ➜ always 200 OK JSON
     if (req.method === "GET" && pathname === "/health") {
       return new Response(JSON.stringify({ status: "ok" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    // Summary of today's and overdue tasks
+    if (req.method === "GET" && pathname === "/getTodaySummary") {
+      const taskId = await getTaskTypeId();
+
+      const todayStr = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+
+      // Tasks due today
+      const dueTodayFilters = [
+        // "t" operator ➜ due today (no values)
+        { due_date: { operator: "t", values: [] } },
+        ...(taskId ? [{ type: { operator: "=", values: [taskId] } }] : []),
+      ];
+      // Overdue tasks (dueDate before today)
+      const overdueFilters = [
+        // "<t-" 0 ➜ due date is more than 0 days in the past (before today)
+        { due_date: { operator: "<t-", values: ["0"] } },
+        ...(taskId ? [{ type: { operator: "=", values: [taskId] } }] : []),
+      ];
+
+      const [todayWps, overdueWps] = await Promise.all([
+        fetchWorkPackages(dueTodayFilters),
+        fetchWorkPackages(overdueFilters),
+      ]);
+
+      const summary = {
+        today: todayWps.map(mapWpSummary),
+        overdue: overdueWps.map(mapWpSummary),
+      };
+
+      return new Response(JSON.stringify(summary), {
         status: 200,
         headers: { "Content-Type": "application/json" },
       });
