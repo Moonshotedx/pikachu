@@ -310,7 +310,7 @@ function mapWpSummary(wp: any) {
 }
 
 // NEW: Reusable function that returns today's and overdue task summaries
-export async function getTodaySummary(): Promise<{ today: any[]; overdue: any[] }> {
+export async function getTodaySummary(): Promise<{ today: any[]; overdue: any[]; in_progress: any[]; roadmaps: any[] }> {
   const taskId = await getTaskTypeId();
 
   // Tasks due today
@@ -325,9 +325,16 @@ export async function getTodaySummary(): Promise<{ today: any[]; overdue: any[] 
     ...(taskId ? [{ type: { operator: "=", values: [taskId] } }] : []),
   ];
 
-  const [todayWps, overdueWps] = await Promise.all([
+  // All open tasks (to derive "in progress")
+  const openFilters = [
+    { status: { operator: "o", values: [] } },
+    ...(taskId ? [{ type: { operator: "=", values: [taskId] } }] : []),
+  ];
+
+  const [todayWps, overdueWps, openWps] = await Promise.all([
     fetchWorkPackages(dueTodayFilters),
     fetchWorkPackages(overdueFilters),
+    fetchWorkPackages(openFilters),
   ]);
 
   // Filter helper – consider a work-package open if status.isClosed !== true
@@ -369,9 +376,33 @@ export async function getTodaySummary(): Promise<{ today: any[]; overdue: any[] 
   const todayIds = new Set(todayOpen.map((wp: any) => wp.id));
   const overdueOpen = overdueWps.filter(isOpen).filter((wp: any) => !todayIds.has(wp.id));
 
+  const combinedExcludedIds = new Set([
+    ...todayOpen.map((wp: any) => wp.id),
+    ...overdueOpen.map((wp: any) => wp.id),
+  ]);
+
+  const isStatusInProgress = (wp: any): boolean => {
+    const name =
+      wp._embedded?.status?.name ??
+      wp.status?.name ??
+      wp._links?.status?.title ??
+      "";
+    return name.toString().toLowerCase() === "in progress";
+  };
+
+  const inProgress = openWps
+    .filter(isOpen)
+    .filter(isStatusInProgress)
+    .filter((wp: any) => !combinedExcludedIds.has(wp.id));
+
+  // Fetch roadmap (version) stats as well
+  const roadmaps = await getRoadmaps();
+
   return {
     today: todayOpen.map(mapWpSummary),
     overdue: overdueOpen.map(mapWpSummary),
+    in_progress: inProgress.map(mapWpSummary),
+    roadmaps,
   };
 }
 
@@ -409,7 +440,7 @@ function escapeHtml(str: string): string {
     .replace(/'/g, "&#39;");
 }
 
-function buildHtmlSummary(summary: { today: any[]; overdue: any[] }): string {
+function buildHtmlSummary(summary: { today: any[]; overdue: any[]; in_progress?: any[]; roadmaps?: any[] }): string {
   const todayStr = new Date().toISOString().slice(0, 10);
   const base = (process.env.OPENPROJECT_BASE_URL ?? "").replace(/\/$/, "");
 
@@ -448,7 +479,7 @@ function buildHtmlSummary(summary: { today: any[]; overdue: any[] }): string {
       </table>`;
   };
 
-  return `<!DOCTYPE html>
+  const parts = [`<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
@@ -459,14 +490,52 @@ function buildHtmlSummary(summary: { today: any[]; overdue: any[] }): string {
     th, td { border: 1px solid #ccc; padding: 6px 10px; text-align: left; }
     th { background: #f0f0f0; }
     a { color: #0366d6; text-decoration: none; }
+    .progress-bar { width: 100px; background: #eee; border: 1px solid #ccc; height: 10px; position: relative; }
+    .progress-bar span { display: block; height: 100%; background: #4caf50; }
   </style>
 </head>
 <body>
-  <h1>📋 Daily Task Summary (${todayStr})</h1>
-  ${section("Due Today", summary.today)}
-  ${section("Overdue Tasks", summary.overdue)}
-</body>
-</html>`;
+  <h1>📋 Daily Task Summary (${todayStr})</h1>`];
+
+  parts.push(section("Due Today", summary.today));
+  if (summary.in_progress && summary.in_progress.length) {
+    parts.push(section("In Progress", summary.in_progress));
+  }
+  parts.push(section("Overdue Tasks", summary.overdue));
+
+  // Roadmaps section
+  if (summary.roadmaps && summary.roadmaps.length) {
+    const rows = summary.roadmaps
+      .map((r: any) => {
+        const versionUrl = base ? `${base}/versions/${r.id}` : "#";
+        const progressBar = `<div class="progress-bar"><span style="width:${r.progress}%"></span></div>`;
+        const progressText = `${r.progress}%`;
+        const nameCol = `<a href="${versionUrl}" target="_blank">${escapeHtml(r.name ?? "Version")}</a>`;
+        const status = escapeHtml(r.status ?? "–");
+        return `<tr>
+          <td>#${r.id}</td>
+          <td>${nameCol}</td>
+          <td>${status}</td>
+          <td>${r.closedWorkPackages}/${r.totalWorkPackages}</td>
+          <td>${progressBar} ${progressText}</td>
+        </tr>`;
+      })
+      .join("\n");
+
+    parts.push(`<h2>Roadmaps</h2>
+      <table>
+        <thead>
+          <tr><th>ID</th><th>Name</th><th>Status</th><th>Closed/Total</th><th>Progress</th></tr>
+        </thead>
+        <tbody>
+          ${rows}
+        </tbody>
+      </table>`);
+  }
+
+  parts.push("</body>\n</html>");
+
+  return parts.join("\n");
 }
 // ---------------------- END HTML SUMMARY HELPERS -------------------------
 
@@ -493,19 +562,35 @@ async function formatDailySummaryMessage(): Promise<string> {
   };
 
   const todayList = summary.today.map((wp) => formatItem(wp)).join("\n");
-  const overdueList = summary.overdue
-    .map((wp) => formatItem(wp, true))
+  const inProgressList = (summary.in_progress ?? []).map((wp) => formatItem(wp, true)).join("\n");
+  const overdueList = summary.overdue.map((wp) => formatItem(wp, true)).join("\n");
+
+  // Roadmaps bullets
+  const roadmapItems = (summary.roadmaps ?? [])
+    .map((r: any) => {
+      const name = truncate(r.name ?? `Version ${r.id}`, 40);
+      return `• **${name}** (#${r.id}) — ${r.progress}% (${r.closedWorkPackages}/${r.totalWorkPackages} closed)`;
+    })
     .join("\n");
 
-  return [
+  const lines = [
     `📋 **Daily Task Summary (${todayStr})**`,
     "",
     "**Due Today:**",
     todayList || "No tasks due today.",
-    "",
-    "**Overdue Tasks:**",
-    overdueList || "No overdue tasks.",
-  ].join("\n");
+  ];
+
+  if (inProgressList) {
+    lines.push("", "**In Progress:**", inProgressList);
+  }
+
+  lines.push("", "**Overdue Tasks:**", overdueList || "No overdue tasks.");
+
+  if (roadmapItems) {
+    lines.push("", "**Roadmaps:**", roadmapItems);
+  }
+
+  return lines.join("\n");
 }
 
 // Scheduler: run at configured times each day to send the summary to Discord
@@ -555,6 +640,431 @@ function scheduleDailySummaries() {
   times.forEach(scheduleForTime);
 }
 
+// ------------------------ ROADMAP (VERSIONS) HELPERS ------------------------
+
+async function fetchRoadmaps(): Promise<any[]> {
+  const baseUrl = process.env.OPENPROJECT_BASE_URL;
+  const apiKey = process.env.OPENPROJECT_API_KEY;
+  if (!baseUrl || !apiKey) {
+    console.error("Missing OPENPROJECT_BASE_URL or OPENPROJECT_API_KEY env vars");
+    return [];
+  }
+
+  const auth = Buffer.from(`apikey:${apiKey}`).toString("base64");
+  const url = `${baseUrl.replace(/\/$/, "")}/api/v3/versions?pageSize=500&include=project`;
+  console.log("➡️  OpenProject GET", url);
+  try {
+    const res = await fetch(url, {
+      headers: { Accept: "application/json", Authorization: `Basic ${auth}` },
+    });
+    if (!res.ok) {
+      console.error(`❌ OpenProject API error (${res.status}) when querying roadmaps`);
+      return [];
+    }
+    const json: any = await res.json();
+    return json._embedded?.elements ?? [];
+  } catch (e) {
+    console.error("❌ Exception while fetching roadmaps", e);
+    return [];
+  }
+}
+
+// Helper: generic count query for work packages given OpenProject filter JSON
+async function fetchWpCount(filters: any[]): Promise<number> {
+  const baseUrl = process.env.OPENPROJECT_BASE_URL;
+  const apiKey = process.env.OPENPROJECT_API_KEY;
+  if (!baseUrl || !apiKey) return 0;
+
+  const auth = Buffer.from(`apikey:${apiKey}`).toString("base64");
+  const qs = new URLSearchParams();
+  qs.set("filters", JSON.stringify(filters));
+  qs.set("pageSize", "1"); // minimal payload – we only need the collection meta
+
+  const url = `${baseUrl.replace(/\/$/, "")}/api/v3/work_packages?${qs.toString()}`;
+  try {
+    const res = await fetch(url, {
+      headers: { Accept: "application/json", Authorization: `Basic ${auth}` },
+    });
+    if (!res.ok) {
+      console.warn(`⚠️  OpenProject API responded ${res.status} when counting WPs for filters ${qs.get("filters")}`);
+      return 0;
+    }
+    const json: any = await res.json();
+    // Work package collection responses include `total` with overall count
+    return typeof json.total === "number" ? json.total : 0;
+  } catch (e) {
+    console.error("❌ Exception while counting work packages", e);
+    return 0;
+  }
+}
+
+function mapRoadmapSummary(v: any) {
+  return {
+    id: v.id,
+    name: v.name,
+    description: v.description?.raw ?? v.description?.html ?? null,
+    status: v.status ?? v._links?.status?.title ?? null,
+    sharing: v.sharing ?? null,
+    startDate: v.startDate ?? v.start_date ?? null,
+    dueDate: v.dueDate ?? v.due_date ?? null,
+    createdAt: v.createdAt ?? v.created_at ?? null,
+    updatedAt: v.updatedAt ?? v.updated_at ?? null,
+    project: v._embedded?.project?.name ?? v._links?.project?.title ?? null,
+    projectId: v._embedded?.project?.id ?? null,
+  };
+}
+
+export async function getRoadmaps(): Promise<any[]> {
+  const versions = await fetchRoadmaps();
+  // Enrich each roadmap with work-package statistics in parallel
+  const enriched = await Promise.all(
+    versions.map(async (v: any) => {
+      const baseSummary = mapRoadmapSummary(v);
+
+      // Total work packages linked to this version
+      const filtersBase = [{ version: { operator: "=", values: [String(v.id)] } }];
+      const total = await fetchWpCount(filtersBase);
+
+      // Closed work packages (status operator "c")
+      const filtersClosed = [...filtersBase, { status: { operator: "c", values: [] } }];
+      const closed = await fetchWpCount(filtersClosed);
+
+      const progress = total === 0 ? 0 : Math.round((closed / total) * 100);
+
+      return {
+        ...baseSummary,
+        totalWorkPackages: total,
+        closedWorkPackages: closed,
+        progress,
+      };
+    }),
+  );
+
+  return enriched;
+}
+
+// ---------------------- END ROADMAP HELPERS -------------------------
+
+// ------------------------ USERS HELPERS ------------------------
+
+async function fetchUsers(): Promise<any[]> {
+  const baseUrl = process.env.OPENPROJECT_BASE_URL;
+  const apiKey = process.env.OPENPROJECT_API_KEY;
+  if (!baseUrl || !apiKey) {
+    console.error("Missing OPENPROJECT_BASE_URL or OPENPROJECT_API_KEY env vars");
+    return [];
+  }
+
+  const auth = Buffer.from(`apikey:${apiKey}`).toString("base64");
+  const principalsUrl = `${baseUrl.replace(/\/$/, "")}/api/v3/principals?pageSize=500`;
+  console.log("➡️  OpenProject GET", principalsUrl);
+  try {
+    const res = await fetch(principalsUrl, {
+      headers: { Accept: "application/json", Authorization: `Basic ${auth}` },
+    });
+    if (!res.ok) {
+      console.error(`❌ OpenProject API error (${res.status}) when querying principals`);
+      return [];
+    }
+    const json: any = await res.json();
+    const all: any[] = json._embedded?.elements ?? [];
+    return all.filter((p) => p._type === "User");
+  } catch (e) {
+    console.error("❌ Exception while fetching users", e);
+    return [];
+  }
+}
+
+function mapUserSummary(u: any) {
+  const composedName = `${u.firstName ?? ""} ${u.lastName ?? ""}`.trim();
+  const nameResolved = u.name ?? (composedName ? composedName : null);
+  return {
+    id: u.id,
+    name: nameResolved,
+    username: u.login ?? u.username ?? null,
+    email: u.email ?? u.mail ?? null,
+  };
+}
+
+// --------------------------------------------------------------------------
+// Static user records that should always be present in /users output even if
+// the API account cannot see them (e.g. external bots, service accounts).
+// Extend or modify as needed.
+const STATIC_USERS = [
+{
+"id": 22,
+"name": "Ranjani MN",
+"username": "1384785830203359284",
+"email": "ranjani.mn@xcelerator.co.in"
+},
+{
+"id": 21,
+"name": "Aakriti Bansal",
+"username": "1384781843425136701",
+"email": "aakriti@xcelerator.co.in"
+},
+{
+"id": 20,
+"name": "Prashanth Xcelerator",
+"username": "851151237482676224",
+"email": "prashanth@xcelerator.co.in"
+},
+{
+"id": 19,
+"name": "chetan J",
+"username": "1372459213124534364",
+"email": "chetan@xcelerator.co.in"
+},
+{
+"id": 18,
+"name": "Savitha Prakash",
+"username": "1384821992380825610",
+"email": "savitha@xcelerator.co.in"
+},
+{
+"id": 17,
+"name": "Anju Reddy K",
+"username": "1308774878421454978",
+"email": "anju@xcelerator.co.in"
+},
+{
+"id": 16,
+"name": "Arpitha HR",
+"username": "1331213092415209472",
+"email": "arpitha@xcelerator.co.in"
+},
+{
+"id": 15,
+"name": "Ashish Yadav",
+"username": "1360127230440771775",
+"email": "ashish@xcelerator.co.in"
+},
+{
+"id": 14,
+"name": "Neeraj H N",
+"username": "1011277746569236520",
+"email": "neeraj@xcelerator.co.in"
+},
+{
+"id": 13,
+"name": "Pooja Gondi",
+"username": "pooja@xcelerator.co.in",
+"email": "pooja@xcelerator.co.in"
+},
+{
+"id": 12,
+"name": "Rajani Kalyani K S",
+"username": "1307937048081989645",
+"email": "rajani@xcelerator.co.in"
+},
+{
+"id": 11,
+"name": "Ranjan SB",
+"username": "1176863192538943508",
+"email": "ranjan@xcelerator.co.in"
+},
+{
+"id": 10,
+"name": "Shreenath G L",
+"username": "1194194201831800924",
+"email": "shreenath@xcelerator.co.in"
+},
+{
+"id": 9,
+"name": "john karamchand",
+"username": "540940684962824192",
+"email": "john@xcelerator.co.in"
+},
+{
+"id": 8,
+"name": "raj sharma",
+"username": "509004765380739107",
+"email": "raj@xcelerator.co.in"
+},
+{
+"id": 7,
+"name": "Sujan Kumar",
+"username": "757931923275382825",
+"email": "sujan@xcelerator.co.in"
+},
+{
+"id": 6,
+"name": "Github User",
+"username": "engineering@xcelerator.co.in",
+"email": "engineering@xcelerator.co.in"
+},
+{
+"id": 5,
+"name": "surya murugan",
+"username": "440449131085824001",
+"email": "surya@xcelerator.co.in"
+},
+{
+"id": 4,
+"name": "OpenProject Admin",
+"username": "admin",
+"email": "it@xcelerator.co.in"
+}
+];
+
+// NEW: helper to build Discord mention for a given assignee name
+function discordTag(assigneeName?: string | null): string {
+  if (!assigneeName) return "";
+  const match = STATIC_USERS.find(
+    (u) => typeof u.name === "string" && u.name.toLowerCase() === assigneeName.toLowerCase(),
+  );
+  if (match && match.username) {
+    return `<@${match.username}>`;
+  }
+  return assigneeName;
+}
+
+// NEW: core logic to send reminders to assignees for due-today and overdue tasks
+async function sendDueUsersReminders(): Promise<{ today: number; overdue: number }> {
+  const summary = await getTodaySummary();
+  const base = (process.env.OPENPROJECT_BASE_URL ?? "").replace(/\/$/, "");
+  const webhook =
+    process.env.DISCORD_DUE_USERS_WEBHOOK_URL ||
+    process.env.DISCORD_SUMMARY_WEBHOOK_URL ||
+    undefined;
+
+  const truncate = (s: string, max = 80) => (s.length > max ? s.slice(0, max - 3) + "..." : s);
+
+  const notify = async (
+    wps: any[],
+    prefixEmoji: string,
+    tag: string,
+    instruction: string,
+  ) => {
+    for (const wp of wps) {
+      const mention = discordTag(wp.assignee);
+      const url = base ? `${base}/work_packages/${wp.id}` : "#";
+      const dueLine = wp.dueDate ? `Due **${wp.dueDate}**` : undefined;
+      const parts = [
+        `${prefixEmoji} **${tag}**`,
+        `${mention} – **#${wp.id}**: *${truncate(wp.subject)}*`,
+        dueLine,
+        instruction,
+        url,
+      ].filter(Boolean);
+      const msg = parts.join("\n");
+      await sendDiscordNotification(msg, webhook);
+    }
+  };
+
+  await notify(
+    summary.today,
+    "📌",
+    "DUE TODAY",
+    "Please update the status of the task is in expected timeline.",
+  );
+  await notify(
+    summary.overdue,
+    "⏰",
+    "OVER_DUE",
+    "Please close the task asap or talk to the team to update it.",
+  );
+
+  return { today: summary.today.length, overdue: summary.overdue.length };
+}
+
+// NEW: scheduler for due-user reminders driven by env var DUE_USERS_TIMES
+function scheduleDueUsersReminders() {
+  const timesEnv = process.env.DUE_USERS_TIMES; // e.g., "09:00,14:00"
+  if (!timesEnv) {
+    console.log("ℹ️  DUE_USERS_TIMES not set; due-user reminders disabled");
+    return;
+  }
+
+  const times = timesEnv.split(/[,;\s]+/).filter(Boolean);
+  if (!times.length) return;
+
+  function scheduleForTime(timeStr: string) {
+    const [hStr, mStr = "0"] = timeStr.split(":");
+    const hour = Number(hStr);
+    const minute = Number(mStr);
+    if (
+      isNaN(hour) ||
+      hour < 0 ||
+      hour > 23 ||
+      isNaN(minute) ||
+      minute < 0 ||
+      minute > 59
+    ) {
+      console.warn(`⚠️  Invalid DUE_USERS_TIMES entry '${timeStr}', skipping`);
+      return;
+    }
+
+    const scheduleNext = () => {
+      const now = new Date();
+      const next = new Date(now);
+      next.setHours(hour, minute, 0, 0);
+      if (next <= now) {
+        next.setDate(now.getDate() + 1);
+      }
+      const delay = next.getTime() - now.getTime();
+      console.log(
+        `⏰ Scheduled due-user reminder for ${timeStr} in ${Math.round(delay / 1000)}s`,
+      );
+      setTimeout(async () => {
+        try {
+          const counts = await sendDueUsersReminders();
+          console.log(
+            `✅ Due-user reminders sent (${timeStr}) – today: ${counts.today}, overdue: ${counts.overdue}`,
+          );
+        } catch (e) {
+          console.error("❌ Failed to send due-user reminders", e);
+        }
+        scheduleNext(); // reschedule for next day
+      }, delay);
+    };
+
+    scheduleNext();
+  }
+
+  times.forEach(scheduleForTime);
+}
+
+export async function getUsers(): Promise<any[]> {
+  const principals = await fetchUsers();
+  const baseUrl = process.env.OPENPROJECT_BASE_URL;
+  const apiKey = process.env.OPENPROJECT_API_KEY;
+  if (!baseUrl || !apiKey) return [];
+  const auth = Buffer.from(`apikey:${apiKey}`).toString("base64");
+
+  const detailed = await Promise.all(
+    principals.map(async (p: any) => {
+      const id = p.id;
+      // Try /users/{id} first
+      const userUrl = `${baseUrl.replace(/\/$/, "")}/api/v3/users/${id}`;
+      try {
+        const res = await fetch(userUrl, { headers: { Accept: "application/json", Authorization: `Basic ${auth}` } });
+        if (res.ok) {
+          const uj = await res.json();
+          return uj;
+        }
+      } catch {}
+
+      // Fallback to principal detail
+      const principalUrl = `${baseUrl.replace(/\/$/, "")}/api/v3/principals/${id}`;
+      try {
+        const res = await fetch(principalUrl, { headers: { Accept: "application/json", Authorization: `Basic ${auth}` } });
+        if (res.ok) return await res.json();
+      } catch {}
+
+      return p; // return original minimal
+    }),
+  );
+
+  const mapped = detailed.map(mapUserSummary);
+
+  // Merge with static list (do not duplicate entries that already exist)
+  const existingIds = new Set(mapped.map((u: any) => u.id));
+  const merged = [...mapped, ...STATIC_USERS.filter((u) => !existingIds.has(u.id))];
+
+  return merged;
+}
+
 // --------------------------------------------------------------------------
 
 serve({
@@ -590,6 +1100,24 @@ serve({
       });
     }
 
+    // Fetch all OpenProject roadmaps (versions)
+    if (req.method === "GET" && pathname === "/getRoadmaps") {
+      const roadmaps = await getRoadmaps();
+      return new Response(JSON.stringify(roadmaps), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    // Fetch all users (id, name, username, email)
+    if (req.method === "GET" && pathname === "/users") {
+      const users = await getUsers();
+      return new Response(JSON.stringify(users), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
     // Trigger daily summary to Discord immediately
     if (req.method === "GET" && pathname === "/triggerNow") {
       try {
@@ -601,6 +1129,23 @@ serve({
         });
       } catch (e) {
         console.error("❌ Failed to send on-demand summary", e);
+        return new Response("Error", { status: 500 });
+      }
+    }
+
+    // NEW: Trigger due-date reminders to individual users
+    if (req.method === "GET" && pathname === "/triggerDueUsers") {
+      try {
+        const counts = await sendDueUsersReminders();
+        return new Response(
+          JSON.stringify({ status: "sent", today: counts.today, overdue: counts.overdue }),
+          {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          },
+        );
+      } catch (e) {
+        console.error("❌ Failed to send due-user notifications", e);
         return new Response("Error", { status: 500 });
       }
     }
@@ -792,3 +1337,5 @@ console.log(`🚀 Pikachu helper listening on port ${effectivePort}`);
 
 // Kick off daily summary scheduler after server start
 scheduleDailySummaries();
+// Kick off due-user reminder scheduler after server start
+scheduleDueUsersReminders();
